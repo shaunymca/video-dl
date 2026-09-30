@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+#
+# video-dl — download videos from YouTube, Dropout.tv and Twitch.
+#
+# Thin wrapper around yt-dlp that picks sane per-site defaults so you only
+# ever have to remember one command:
+#
+#   video-dl <url> [url ...]
+#
+set -euo pipefail
+
+VERSION="1.0.0"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/video-dl"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+# ---------------------------------------------------------------- defaults ---
+DEST="${VIDEO_DL_DEST:-$HOME/Videos}"
+QUALITY="${VIDEO_DL_QUALITY:-1080}"   # max height, or "best"
+AUDIO_ONLY=0
+ANY_CODEC="${VIDEO_DL_ANY_CODEC:-0}"  # 1 = ignore Apple playback compatibility
+KEEP_BRAND="${VIDEO_DL_KEEP_BRAND:-0}"  # 1 = keep the "Dimension 20: " prefix
+PROBE_ERROR=""                        # first error line from a failed lookup
+SHOW=""                               # override the show folder name
+SEASON=""                             # override the season folder name
+SUBS=1                                # embed subtitles when available
+BROWSER="${VIDEO_DL_BROWSER:-}"       # chrome|safari|firefox|brave|edge — for auth cookies
+DRY_RUN=0
+ARCHIVE="${VIDEO_DL_ARCHIVE:-$CONFIG_DIR/downloaded.txt}"
+USE_ARCHIVE=0
+declare -a EXTRA_ARGS=()
+
+# Config file is sourced, so it can override any of the above.
+# shellcheck source=/dev/null
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+# ------------------------------------------------------------------- usage ---
+usage() {
+  cat <<'EOF'
+video-dl — one command to download from YouTube, Dropout.tv and Twitch
+
+USAGE
+  video-dl [options] <url> [url ...]
+  video-dl --setup            interactive first-run setup
+  video-dl --check            verify dependencies and config
+
+OPTIONS
+  -o, --dest DIR        where to save (default: ~/Videos, per-site subfolder)
+  -q, --quality N       max height: 480, 720, 1080, 1440, 2160, or "best"
+  -a, --audio           audio only (m4a)
+  -b, --browser NAME    take login cookies from this browser
+                        (chrome|safari|firefox|brave|edge) — needed for
+                        Dropout.tv and sub-only Twitch VODs
+      --any-codec       allow AV1/VP9/Opus — smaller files at the same quality,
+                        but QuickTime and Apple apps may refuse to play them
+      --keep-brand      keep Dropout's brand prefix, so "Dimension 20: Fantasy
+                        High" files under dimension_20_fantasy_high/
+      --show NAME       override the show folder (Dropout), e.g. fantasy_high
+      --season NAME     override the season folder, e.g. season_1
+      --no-subs         skip subtitles
+      --archive         skip anything already downloaded (good for playlists)
+  -n, --dry-run         print the yt-dlp command without running it
+  -h, --help            this message
+  -V, --version         version
+
+Anything after `--` is passed straight through to yt-dlp:
+  video-dl <url> -- --playlist-items 1-5
+
+EXAMPLES
+  video-dl 'https://www.youtube.com/watch?v=...'
+  video-dl -a 'https://www.youtube.com/playlist?list=...' --archive
+  video-dl -b chrome 'https://www.dropout.tv/dimension-20.../season-1/videos/...'
+  video-dl -q 720 'https://www.twitch.tv/videos/123456789'
+
+CONFIG
+  Defaults live in ~/.config/video-dl/config — run `video-dl --setup` to create it.
+EOF
+}
+
+die() { printf 'video-dl: %s\n' "$1" >&2; exit 1; }
+note() { printf '\033[2m%s\033[0m\n' "$1" >&2; }
+
+# ------------------------------------------------------------ dependencies ---
+check_deps() {
+  local missing=()
+  command -v yt-dlp  >/dev/null 2>&1 || missing+=(yt-dlp)
+  command -v ffmpeg  >/dev/null 2>&1 || missing+=(ffmpeg)
+  if (( ${#missing[@]} )); then
+    printf 'Missing: %s\n' "${missing[*]}" >&2
+    printf 'Install with:  brew install %s\n' "${missing[*]}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# ----------------------------------------------------------------- helpers ---
+# "Dimension 20: Fantasy High" -> "dimension_20_fantasy_high"
+# yt-dlp's output templates can't change case, so folder slugs are built here.
+slugify() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -e 's/[^a-z0-9]\{1,\}/_/g' -e 's/^_//' -e 's/_*$//'
+}
+
+# Dropout names shows "Brand: Show" — "Dimension 20: Fantasy High". Each
+# campaign is its own show as far as viewers are concerned, so the brand prefix
+# comes off and Fantasy High sits alongside Game Changer under dropout/.
+strip_brand() {
+  if (( KEEP_BRAND )); then printf '%s' "$1"; return; fi
+  case "$1" in
+    *:*) printf '%s' "${1#*:}" ;;
+    *)   printf '%s' "$1" ;;
+  esac
+}
+
+# Ask yt-dlp about the first item behind a URL. The show name is the same for
+# every episode of a season, so one cheap lookup settles the folder layout
+# without a probe per episode.
+probe() {
+  local url="$1" fields="$2" out errfile
+  local -a cmd=( yt-dlp --playlist-items 1 --simulate --print "$fields" --ignore-no-formats-error )
+  [[ -n "$BROWSER" ]] && cmd+=( --cookies-from-browser "$BROWSER" )
+  cmd+=( -- "$url" )
+
+  # Keep stderr: a lookup that fails (expired cookies, say) otherwise looks
+  # exactly like a show that has no metadata, and we'd file it in the wrong
+  # place without ever saying why.
+  errfile="$(mktemp -t video-dl-probe)"
+  out="$("${cmd[@]}" 2>"$errfile" | head -1 || true)"
+  PROBE_ERROR="$(grep -m1 -E '^(ERROR|WARNING)' "$errfile" 2>/dev/null || true)"
+  rm -f "$errfile"
+  printf '%s' "$out"
+}
+
+# yt-dlp's Dropout extractor only recognises the watch. host; the bare and www
+# hosts are the marketing site and fall through to the generic extractor, which
+# 404s on video paths. Rewrite them so either form works.
+normalize_url() {
+  case "$1" in
+    *//dropout.tv/*|*//www.dropout.tv/*)
+      printf '%s' "$1" | sed -E 's#//(www\.)?dropout\.tv/#//watch.dropout.tv/#' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# ------------------------------------------------------------ site routing ---
+# Prints a site key for a URL: youtube | dropout | twitch | other
+site_of() {
+  local url; url="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$url" in
+    *youtube.com*|*youtu.be*|*youtube-nocookie.com*) echo youtube ;;
+    *dropout.tv*)                                    echo dropout ;;
+    *twitch.tv*)                                     echo twitch  ;;
+    *)                                               echo other   ;;
+  esac
+}
+
+# Builds the "<show>/<season>/<episode>.<ext>" part of a Dropout path, e.g.
+#   dimension_20_fantasy_high/season_1/S01E01 - The Name.mp4
+#
+# Dropout describes its catalogue two different ways depending on the show:
+# either the series carries the show name and seasons are numbered, or the
+# series is the brand and the season itself is named. Probing the first item
+# tells us which shape we're dealing with.
+dropout_path() {
+  local url="$1" show="$SHOW" season="$SEASON" meta series season_no season_name
+
+  if [[ -z "$show" || -z "$season" ]]; then
+    meta="$(probe "$url" '%(series,playlist_title,uploader|)s@@%(season_number|)s@@%(season|)s')"
+    series="${meta%%@@*}"
+    season_name="${meta##*@@}"
+    season_no="${meta#*@@}"; season_no="${season_no%%@@*}"
+  fi
+
+  [[ -n "$show" ]] || show="$(slugify "$(strip_brand "$series")")"
+
+  if [[ -z "$show" && -z "$season" && -z "$season_no" && -z "$season_name" ]]; then
+    note "couldn't read show/season metadata — filing directly under dropout/"
+    [[ -n "$PROBE_ERROR" ]] && note "  yt-dlp said: $PROBE_ERROR"
+    note "  set the folders yourself with: --show <name> --season <name>"
+  fi
+
+  if [[ -z "$season" ]]; then
+    if [[ -n "$season_no" ]]; then
+      # Numbered seasons vary per episode, so this stays a template field.
+      season="season_%(season_number)s"
+    elif [[ -n "$season_name" ]]; then
+      season="$(slugify "$season_name")"
+    fi
+  fi
+
+  # `&` emits the SxxExx prefix only when Dropout reports those numbers, so
+  # one-off specials get a bare title instead of "S00E00 - ".
+  local file='%(season_number&S{:02}|)s%(episode_number&E{:02} - |)s%(title)s.%(ext)s'
+
+  # Join whichever folders we actually know about, so a show with no metadata
+  # lands directly in dropout/ rather than in a redundant dropout/dropout/.
+  local path=""
+  [[ -n "$show" ]]   && path="$show/"
+  [[ -n "$season" ]] && path="$path$season/"
+  printf '%s%s' "$path" "$file"
+}
+
+# Fills the global ARGS array with the right yt-dlp invocation for one URL.
+build_args() {
+  local url="$1" site; site="$(site_of "$url")"
+  local fmt outdir
+
+  # Output layout: ~/Videos/<Site>/<Show or Uploader>/<title>.<ext>
+  case "$site" in
+    youtube) outdir="$DEST/youtube/%(uploader)s/%(title)s [%(id)s].%(ext)s" ;;
+    dropout) outdir="$DEST/dropout/$(dropout_path "$url")" ;;
+    twitch)  outdir="$DEST/twitch/%(uploader)s/%(upload_date>%Y-%m-%d)s - %(title)s [%(id)s].%(ext)s" ;;
+    *)       outdir="$DEST/%(extractor)s/%(title)s [%(id)s].%(ext)s" ;;
+  esac
+
+  # Format selection.
+  #
+  # YouTube's best-quality streams are AV1/VP9 video with Opus audio, which
+  # QuickTime and the rest of the Apple stack won't open even inside an .mp4.
+  # So unless asked otherwise we ask for H.264 + AAC first and only fall back
+  # to the modern codecs when nothing else exists (common above 1080p).
+  local h=""
+  [[ "$QUALITY" == "best" ]] || h="[height<=${QUALITY}]"
+
+  if (( AUDIO_ONLY )); then
+    fmt="bestaudio[acodec^=mp4a]/bestaudio/best"
+  elif (( ANY_CODEC )); then
+    fmt="bestvideo${h}+bestaudio/best${h}/best"
+  else
+    fmt="bestvideo${h}[vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo${h}[vcodec^=avc1]+bestaudio/bestvideo${h}+bestaudio/best${h}/best"
+  fi
+
+  ARGS=(
+    yt-dlp
+    --format "$fmt"
+    --output "$outdir"
+    --no-overwrites
+    --continue
+    --retries 10
+    --fragment-retries 10
+    --concurrent-fragments 4
+    --embed-metadata
+    --embed-chapters
+    --progress
+  )
+
+  if (( AUDIO_ONLY )); then
+    ARGS+=( --extract-audio --audio-format m4a --audio-quality 0 --embed-thumbnail )
+  else
+    # mp4 plays everywhere on macOS; mkv is the fallback when streams can't be muxed.
+    ARGS+=( --merge-output-format mp4 )
+    (( SUBS )) && ARGS+=( --embed-subs --sub-langs 'en.*,-live_chat' )
+  fi
+
+  (( USE_ARCHIVE )) && ARGS+=( --download-archive "$ARCHIVE" )
+
+  # Per-site extras.
+  case "$site" in
+    youtube)
+      # The audio branch already asked for a thumbnail.
+      (( AUDIO_ONLY )) || ARGS+=( --embed-thumbnail )
+      ARGS+=( --sponsorblock-mark all )
+      ;;
+    dropout)
+      # Dropout is subscriber-only: every request needs your session cookies.
+      if [[ -z "$BROWSER" ]]; then
+        die "dropout.tv needs a login. Re-run with -b chrome (or safari/firefox), or set BROWSER in $CONFIG_FILE"
+      fi
+      ;;
+    twitch)
+      # A live channel URL has no /videos/ or /clip/ segment. Recording one to
+      # mpegts keeps the partial file playable if the stream drops; VODs and
+      # clips are finite, so they get the normal mp4 path.
+      case "$url" in
+        *twitch.tv/videos/*|*twitch.tv/*/clip/*|*clips.twitch.tv/*) ;;
+        *) ARGS+=( --hls-use-mpegts ) ;;
+      esac
+      ;;
+  esac
+
+  [[ -n "$BROWSER" ]] && ARGS+=( --cookies-from-browser "$BROWSER" )
+
+  (( ${#EXTRA_ARGS[@]} )) && ARGS+=( "${EXTRA_ARGS[@]}" )
+  ARGS+=( -- "$url" )
+}
+
+# ------------------------------------------------------------------- setup ---
+write_config() {
+  mkdir -p "$CONFIG_DIR"
+  cat > "$CONFIG_FILE" <<EOF
+# video-dl config — plain shell, sourced at startup.
+DEST="$1"
+QUALITY="$2"
+BROWSER="$3"
+# ANY_CODEC=1   # uncomment to allow AV1/VP9/Opus (smaller, worse Apple playback)
+# SUBS=0        # uncomment to stop embedding subtitles
+EOF
+  mkdir -p "$1"
+  printf 'Wrote %s\n' "$CONFIG_FILE"
+  printf '  dest=%s quality=%s browser=%s\n' "$1" "$2" "${3:-none}"
+}
+
+# Prompt for one value. The prompt goes to stderr explicitly, because bash's
+# `read -p` stays silent when stdin isn't a terminal.
+ask() {
+  local prompt="$1" default="$2" reply=""
+  printf '%s [%s]: ' "$prompt" "$default" >&2
+  IFS= read -r reply || reply=""
+  printf '%s' "${reply:-$default}"
+}
+
+do_setup() {
+  # No terminal (a pipe, a CI job, or Claude Code's `!` prefix) means there is
+  # nobody to answer the prompts, so take the defaults and any flags given.
+  if [[ ! -t 0 ]]; then
+    note "no terminal on stdin — writing defaults without prompting"
+    note "to choose values non-interactively, put the flags before --setup:"
+    note "  video-dl -o ~/Movies/Downloads -q 1080 -b chrome --setup"
+    write_config "$DEST" "$QUALITY" "$BROWSER"
+    return 0
+  fi
+
+  local dest quality browser
+  dest="$(ask 'Save videos to' "$DEST")"
+  quality="$(ask 'Max quality (480/720/1080/1440/2160/best)' "$QUALITY")"
+  browser="$(ask 'Browser for login cookies, needed for Dropout (chrome/safari/firefox/brave/edge, or none)' "${BROWSER:-none}")"
+  [[ "$browser" == "none" ]] && browser=""
+
+  write_config "${dest/#\~/$HOME}" "$quality" "$browser"
+}
+
+# -------------------------------------------------------------------- args ---
+declare -a URLS=()
+while (( $# )); do
+  case "$1" in
+    -o|--dest)     DEST="${2:?}"; shift 2 ;;
+    -q|--quality)  QUALITY="${2:?}"; shift 2 ;;
+    -a|--audio)    AUDIO_ONLY=1; shift ;;
+    --any-codec)   ANY_CODEC=1; shift ;;
+    --keep-brand)  KEEP_BRAND=1; shift ;;
+    --show)        SHOW="$(slugify "${2:?}")"; shift 2 ;;
+    --season)      SEASON="${2:?}"; shift 2 ;;
+    -b|--browser)  BROWSER="${2:?}"; shift 2 ;;
+    --no-subs)     SUBS=0; shift ;;
+    --archive)     USE_ARCHIVE=1; shift ;;
+    -n|--dry-run)  DRY_RUN=1; shift ;;
+    --setup)       do_setup; exit 0 ;;
+    --check)       check_deps && printf 'Dependencies OK.\nConfig: %s\nDest:   %s\nQuality: %s\nBrowser: %s\n' \
+                     "${CONFIG_FILE}$([[ -f $CONFIG_FILE ]] || echo ' (not created)')" "$DEST" "$QUALITY" "${BROWSER:-none}"; exit $? ;;
+    -h|--help)     usage; exit 0 ;;
+    -V|--version)  printf 'video-dl %s\n' "$VERSION"; exit 0 ;;
+    --)            shift; EXTRA_ARGS=("$@"); break ;;
+    -*)            die "unknown option: $1 (see --help)" ;;
+    *)             URLS+=("$1"); shift ;;
+  esac
+done
+
+(( ${#URLS[@]} )) || { usage; exit 1; }
+check_deps || exit 1
+mkdir -p "$(dirname "$ARCHIVE")"
+
+status=0
+for raw_url in "${URLS[@]}"; do
+  url="$(normalize_url "$raw_url")"
+  [[ "$url" == "$raw_url" ]] || note "rewrote host to watch.dropout.tv"
+  build_args "$url"
+  if (( DRY_RUN )); then
+    printf '%q ' "${ARGS[@]}"; printf '\n'
+    continue
+  fi
+  note "→ $(site_of "$url"): $url"
+  "${ARGS[@]}" || { status=1; printf 'video-dl: failed on %s\n' "$url" >&2; }
+done
+exit $status
